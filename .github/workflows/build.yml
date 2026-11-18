@@ -1,0 +1,83 @@
+name: Build BrightBean Studio image
+
+# Bouwt het Docker-image van brightbeanxyz/brightbean-studio (ongewijzigd, AGPL-3.0)
+# op GitHub in plaats van op de Coolify-VPS, en zet het op GHCR.
+# Bijwerken: zet een nieuwe commit-SHA in BRIGHTBEAN_REF en push,
+# of start deze workflow handmatig met een andere ref.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - BRIGHTBEAN_REF
+      - .github/workflows/build.yml
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit, branch of tag van brightbeanxyz/brightbean-studio (leeg = BRIGHTBEAN_REF)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/ruben-wadup/brightbean-studio
+  UPSTREAM: brightbeanxyz/brightbean-studio
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout deze repo
+        uses: actions/checkout@v4
+
+      - name: Bepaal upstream-ref
+        id: ref
+        env:
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          REF="${INPUT_REF:-$(tr -d '[:space:]' < BRIGHTBEAN_REF)}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout BrightBean Studio
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.ref.outputs.ref }}
+          path: src
+
+      - name: Korte SHA
+        id: sha
+        run: echo "short=$(git -C src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build en push
+        uses: docker/build-push-action@v6
+        with:
+          context: src
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.sha.outputs.short }}
+            ${{ env.IMAGE }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.sha.outputs.short }}
+            org.opencontainers.image.licenses=AGPL-3.0
+            org.opencontainers.image.description=BrightBean Studio (ongewijzigd) van github.com/${{ env.UPSTREAM }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
