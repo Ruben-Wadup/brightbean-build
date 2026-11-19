@@ -14,6 +14,7 @@ draaien openbaar: upstream op de commit uit `BRIGHTBEAN_REF`, plus deze patches.
 |---|---|
 | `0001-instagram-story.patch` | Keuze "Publish as: Feed post / Reel / Story" bij Instagram in de composer; geen caption en geen eerste reactie bij een story. Aangeboden aan upstream als [PR #243](https://github.com/brightbeanxyz/brightbean-studio/pull/243). |
 | `0002-google-business-locaties.patch` | Google Bedrijfsprofiel: vestigingen ophalen met de verplichte `readMask` (zonder lukte koppelen nooit), vestiging(en) kiezen via het keuzescherm, posts naar precies de gekozen vestiging, en één vestiging loskoppelen trekt de gedeelde Google-toegang niet in. |
+| `0003-google-business-knop-en-taal.patch` | Google Bedrijfsprofiel: in de composer een knop met link (Meer informatie, Boeken, Bestellen, Kopen, Aanmelden) en de taal van de post. Posts zonder eigen taal, ook via de API, krijgen `GOOGLE_BUSINESS_LANGUAGE_CODE` (standaard `en`, bij ons `nl`). |
 
 Een image met patches krijgt de tag `<korte-sha>-wadup.<hash>`; de hash volgt de inhoud van de patches.
 Zonder patches is de tag `<korte-sha>`.

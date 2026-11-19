@@ -1,0 +1,453 @@
+# Eigen patch voor BrightBean Studio (AGPL-3.0), bovenop 0001 en 0002.
+# Google Bedrijfsprofiel: knop met link (Meer informatie, Boeken, Bestellen, Kopen,
+# Aanmelden) en de taal van de post in de composer. Posts zonder eigen taal krijgen
+# GOOGLE_BUSINESS_LANGUAGE_CODE (standaard en) in plaats van een vaste en.
+diff --git a/apps/composer/tests/test_google_business_settings.py b/apps/composer/tests/test_google_business_settings.py
+new file mode 100644
+index 0000000..dba0054
+--- /dev/null
++++ b/apps/composer/tests/test_google_business_settings.py
+@@ -0,0 +1,91 @@
++"""Google Business Profile button and language in the composer.
++
++Same marker contract as the Facebook and Instagram panels: only a submit that
++carries ``google_business_panel_<id>`` may change the stored settings.
++"""
++
++from django.test import override_settings
++from django.urls import reverse
++
++from apps.composer.models import PlatformPost
++from apps.composer.tests.test_account_scope import AccountScopeTestsBase
++from apps.social_accounts.models import SocialAccount
++
++OK_STATUSES = (200, 204, 302)
++
++
++class GoogleBusinessSettingsTests(AccountScopeTestsBase):
++    def setUp(self):
++        super().setUp()
++        self.gbp = SocialAccount.objects.create(
++            workspace=self.workspace,
++            platform="google_business",
++            account_platform_id="accounts/1/locations/10",
++            account_name="Location",
++            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
++        )
++        self.gbp_pp = PlatformPost.objects.create(
++            post=self.post,
++            social_account=self.gbp,
++            status=PlatformPost.Status.DRAFT,
++        )
++
++    def _gbp_payload(self, panel=True, **values):
++        account_id = str(self.gbp.id)
++        fields = {f"google_business_panel_{account_id}": "1"} if panel else {}
++        for key, value in values.items():
++            fields[f"gbp_{key}_{account_id}"] = value
++        return self._payload(selected_accounts=account_id, account_scope=account_id, **fields)
++
++    def _save(self, data):
++        response = self.client.post(self.save_url, data=data)
++        self.assertIn(response.status_code, OK_STATUSES)
++        self.gbp_pp.refresh_from_db()
++
++    def test_button_link_and_language_round_trip_into_platform_extra(self):
++        self._save(self._gbp_payload(cta_type="BOOK", link_url="https://example.com/a", language_code="nl"))
++
++        self.assertEqual(
++            self.gbp_pp.platform_extra,
++            {"cta_type": "BOOK", "link_url": "https://example.com/a", "language_code": "nl"},
++        )
++
++    def test_no_button_clears_an_earlier_one_and_keeps_other_extras(self):
++        self.gbp_pp.platform_extra = {"cta_type": "BOOK", "link_url": "https://example.com/a", "topic_type": "STANDARD"}
++        self.gbp_pp.save(update_fields=["platform_extra"])
++
++        self._save(self._gbp_payload(cta_type="", link_url="https://example.com/a", language_code="nl"))
++
++        self.assertEqual(self.gbp_pp.platform_extra, {"topic_type": "STANDARD", "language_code": "nl"})
++
++    def test_a_button_without_a_web_link_is_not_stored(self):
++        for link in ("", "example.com/a", "javascript:alert(1)", "ftp://example.com/a"):
++            with self.subTest(link=link):
++                self._save(self._gbp_payload(cta_type="LEARN_MORE", link_url=link))
++
++                self.assertNotIn("cta_type", self.gbp_pp.platform_extra or {})
++                self.assertNotIn("link_url", self.gbp_pp.platform_extra or {})
++
++    def test_an_unknown_button_or_language_is_not_stored(self):
++        self._save(self._gbp_payload(cta_type="CALL", link_url="https://example.com/a", language_code="xx"))
++
++        self.assertEqual(self.gbp_pp.platform_extra, {})
++
++    def test_a_save_without_the_panel_leaves_the_settings_alone(self):
++        saved = {"cta_type": "BOOK", "link_url": "https://example.com/a", "language_code": "nl"}
++        self.gbp_pp.platform_extra = saved
++        self.gbp_pp.save(update_fields=["platform_extra"])
++
++        self._save(self._gbp_payload(panel=False))
++
++        self.assertEqual(self.gbp_pp.platform_extra, saved)
++
++    @override_settings(GOOGLE_BUSINESS_LANGUAGE_CODE="nl")
++    def test_the_composer_offers_the_panel_with_the_default_language(self):
++        compose_url = reverse("composer:compose", kwargs={"workspace_id": self.workspace.id})
++
++        response = self.client.get(compose_url)
++
++        self.assertContains(response, "Google Business Settings")
++        self.assertContains(response, '<option value="nl">Dutch</option>')
++        self.assertContains(response, "language_code || 'nl'")
+diff --git a/apps/composer/views.py b/apps/composer/views.py
+index 99b6e69..699ecdc 100644
+--- a/apps/composer/views.py
++++ b/apps/composer/views.py
+@@ -7,7 +7,7 @@ import logging
+ import re
+ import uuid
+ from datetime import UTC, datetime
+-from urllib.parse import urljoin
++from urllib.parse import urljoin, urlparse
+ 
+ import httpx
+ from dateutil import parser as date_parser
+@@ -37,6 +37,9 @@ from apps.members.models import WorkspaceMembership
+ from apps.social_accounts.models import SocialAccount
+ from apps.workspaces.models import Workspace
+ from providers import is_video_only, requires_media
++from providers.google_business import CTA_ACTION_TYPES as GOOGLE_BUSINESS_CTA_TYPES
++from providers.google_business import LANGUAGE_CHOICES as GOOGLE_BUSINESS_LANGUAGE_CHOICES
++from providers.google_business import LANGUAGE_CODES as GOOGLE_BUSINESS_LANGUAGE_CODES
+ from providers.tiktok import VALID_PRIVACY_LEVELS as TIKTOK_PRIVACY_LEVELS
+ 
+ from .forms import ContentCategoryForm, PostForm
+@@ -72,6 +75,14 @@ MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB cap on CSV planner imports
+ _QUEUE_FULL_MSG = "No open posting slot within the scheduling horizon — add posting slots or free one up."
+ 
+ 
++def _is_web_url(value: str) -> bool:
++    """True for an absolute http(s) URL of sensible length (a button target)."""
++    if not value or len(value) > 2048:
++        return False
++    parsed = urlparse(value)
++    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
++
++
+ def _get_workspace(request, workspace_id):
+     """Resolve workspace and enforce membership check."""
+     workspace = get_object_or_404(Workspace, id=workspace_id)
+@@ -311,6 +322,27 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
+                 extra.pop("post_type", None)
+             pp.platform_extra = extra
+ 
++        elif account.platform == "google_business" and f"google_business_panel_{acc_id}" in request.POST:
++            # Same marker contract as the Facebook and Instagram panels. The
++            # button needs both a known action and a web URL; otherwise neither
++            # is kept, so a half-filled panel never sends an invalid
++            # callToAction that would make Google reject the whole post.
++            extra = {**(pp.platform_extra or {})}
++            cta_type = request.POST.get(f"gbp_cta_type_{acc_id}", "").strip()
++            link_url = request.POST.get(f"gbp_link_url_{acc_id}", "").strip()
++            if cta_type in GOOGLE_BUSINESS_CTA_TYPES and _is_web_url(link_url):
++                extra["cta_type"] = cta_type
++                extra["link_url"] = link_url
++            else:
++                extra.pop("cta_type", None)
++                extra.pop("link_url", None)
++            language_code = request.POST.get(f"gbp_language_code_{acc_id}", "").strip()
++            if language_code in GOOGLE_BUSINESS_LANGUAGE_CODES:
++                extra["language_code"] = language_code
++            else:
++                extra.pop("language_code", None)
++            pp.platform_extra = extra
++
+         elif account.platform == "youtube":
+             tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
+             privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
+@@ -923,6 +955,8 @@ def compose(request, workspace_id, post_id=None):
+         # The file picker offers what upload_media will accept (it validates by
+         # the bytes, through the media library), not every image/* and video/*.
+         "media_input_accept": get_accepted_file_types("image", "video"),
++        "google_business_languages": GOOGLE_BUSINESS_LANGUAGE_CHOICES,
++        "google_business_default_language": settings.GOOGLE_BUSINESS_LANGUAGE_CODE,
+     }
+     return render(request, "composer/compose.html", context)
+ 
+diff --git a/apps/publisher/engine.py b/apps/publisher/engine.py
+index 2ba1577..0684db0 100644
+--- a/apps/publisher/engine.py
++++ b/apps/publisher/engine.py
+@@ -837,6 +837,11 @@ class PublishEngine:
+             if platform == "linkedin_company" and "author" not in extra:
+                 extra["author"] = f"urn:li:organization:{account.account_platform_id}"
+ 
++            # Google Business: a post without its own language gets the
++            # instance default instead of the provider's hard-coded "en".
++            if platform == "google_business" and not extra.get("language_code"):
++                extra["language_code"] = settings.GOOGLE_BUSINESS_LANGUAGE_CODE
++
+             # Pop link_url from extra and set on PublishContent directly
+             link_url = extra.pop("link_url", None)
+ 
+diff --git a/apps/publisher/test_google_business_language.py b/apps/publisher/test_google_business_language.py
+new file mode 100644
+index 0000000..0893ff3
+--- /dev/null
++++ b/apps/publisher/test_google_business_language.py
+@@ -0,0 +1,70 @@
++"""A Google Business post without a language of its own gets the instance
++default (GOOGLE_BUSINESS_LANGUAGE_CODE), not a hard-coded "en"."""
++
++from unittest.mock import MagicMock, patch
++
++from django.test import SimpleTestCase, override_settings
++
++from apps.publisher.engine import PublishEngine
++from providers.types import AuthType, PostType, PublishResult
++
++
++def _mocks(platform, platform_extra):
++    account = MagicMock()
++    account.platform = platform
++    account.account_platform_id = "accounts/1/locations/10"
++    account.token_expires_at = None
++    account.oauth_access_token = "tok"
++    account.account_name = "Location"
++
++    platform_post = MagicMock()
++    platform_post.social_account = account
++    platform_post.post.media_attachments.select_related.return_value.order_by.return_value = []
++    platform_post.post.tags = []
++    platform_post.effective_caption = "hello"
++    platform_post.effective_title = None
++    platform_post.effective_first_comment = None
++    platform_post.platform_extra = platform_extra
++
++    provider = MagicMock()
++    provider.auth_type = AuthType.OAUTH2
++    provider.supported_post_types = [PostType.TEXT]
++    provider.needs_local_media = False
++    provider.publish_is_async = False
++    provider.publish_post.return_value = PublishResult(platform_post_id="p1", url=None, extra={})
++    return platform_post, provider
++
++
++@override_settings(GOOGLE_BUSINESS_LANGUAGE_CODE="nl")
++@patch("apps.publisher.engine._resolve_publish_credentials", return_value={})
++@patch("apps.publisher.engine.get_provider")
++class GoogleBusinessLanguageTest(SimpleTestCase):
++    def _content(self, get_provider, platform, platform_extra):
++        platform_post, provider = _mocks(platform, platform_extra)
++        get_provider.return_value = provider
++        PublishEngine()._dispatch_to_provider(platform_post)
++        _token, content = provider.publish_post.call_args.args
++        return content
++
++    def test_a_post_without_a_language_gets_the_instance_default(self, get_provider, _creds):
++        content = self._content(get_provider, "google_business", {})
++
++        self.assertEqual(content.extra["language_code"], "nl")
++
++    def test_a_chosen_language_is_kept(self, get_provider, _creds):
++        content = self._content(get_provider, "google_business", {"language_code": "de"})
++
++        self.assertEqual(content.extra["language_code"], "de")
++
++    def test_the_button_link_reaches_the_provider(self, get_provider, _creds):
++        content = self._content(
++            get_provider, "google_business", {"cta_type": "BOOK", "link_url": "https://example.com/a"}
++        )
++
++        self.assertEqual(content.link_url, "https://example.com/a")
++        self.assertEqual(content.extra["cta_type"], "BOOK")
++
++    def test_other_platforms_get_no_language(self, get_provider, _creds):
++        content = self._content(get_provider, "facebook", {})
++
++        self.assertNotIn("language_code", content.extra)
+diff --git a/config/settings/base.py b/config/settings/base.py
+index d357a9b..886b376 100644
+--- a/config/settings/base.py
++++ b/config/settings/base.py
+@@ -509,6 +509,9 @@ _META_CREDENTIALS = {
+     "config_id": env("PLATFORM_FACEBOOK_CONFIG_ID", default=""),
+     "human_agent_enabled": env.bool("PLATFORM_FACEBOOK_HUMAN_AGENT_ENABLED", default=False),
+ }
++# languageCode for Google Business Profile posts that do not pick one in the
++# composer (API and MCP posts included). Google uses it to decide who sees the post.
++GOOGLE_BUSINESS_LANGUAGE_CODE = env("GOOGLE_BUSINESS_LANGUAGE_CODE", default="en")
+ _GOOGLE_CREDENTIALS = {
+     "client_id": env("PLATFORM_GOOGLE_CLIENT_ID", default=""),
+     "client_secret": env("PLATFORM_GOOGLE_CLIENT_SECRET", default=""),
+diff --git a/providers/google_business.py b/providers/google_business.py
+index 6fa225e..13a918e 100644
+--- a/providers/google_business.py
++++ b/providers/google_business.py
+@@ -31,6 +31,23 @@ POSTS_API = "https://mybusiness.googleapis.com/v4"
+ LOCATION_READ_MASK = "name,title,storefrontAddress,phoneNumbers"
+ PAGE_SIZE = 100
+ 
++# Call-to-action buttons that open a URL. CALL is left out on purpose: it dials
++# the profile's phone number and takes no URL, so it cannot carry the link.
++CTA_ACTION_TYPES = ("LEARN_MORE", "BOOK", "ORDER", "SHOP", "SIGN_UP")
++DEFAULT_CTA_ACTION_TYPE = "LEARN_MORE"
++
++# Languages offered in the composer for a post's languageCode (BCP-47).
++LANGUAGE_CHOICES = (
++    ("nl", "Dutch"),
++    ("en", "English"),
++    ("de", "German"),
++    ("fr", "French"),
++    ("es", "Spanish"),
++    ("it", "Italian"),
++    ("pt", "Portuguese"),
++)
++LANGUAGE_CODES = tuple(code for code, _label in LANGUAGE_CHOICES)
++
+ 
+ class GoogleBusinessProvider(SocialProvider):
+     """Google Business Profile provider.
+@@ -331,6 +348,14 @@ class GoogleBusinessProvider(SocialProvider):
+             "topicType": topic_type,
+         }
+ 
++        # A link becomes the post's button; without one Google shows no button
++        # and a URL in the summary is plain, unclickable text.
++        if content.link_url:
++            action_type = content.extra.get("cta_type") or DEFAULT_CTA_ACTION_TYPE
++            if action_type not in CTA_ACTION_TYPES:
++                action_type = DEFAULT_CTA_ACTION_TYPE
++            body["callToAction"] = {"actionType": action_type, "url": content.link_url}
++
+         # Attach media
+         if content.media_urls:
+             body["media"] = [{"mediaFormat": "PHOTO", "sourceUrl": url} for url in content.media_urls]
+diff --git a/templates/composer/compose.html b/templates/composer/compose.html
+index f8fa2b0..79bfd1c 100644
+--- a/templates/composer/compose.html
++++ b/templates/composer/compose.html
+@@ -627,6 +627,63 @@
+                     </div>
+                 </template>
+ 
++                <!-- Google Business Profile: button + language -->
++                <template x-for="accId in selectedAccounts" :key="'google-business-settings-' + accId">
++                    <div x-show="charLimits[accId]?.platform === 'google_business'"
++                         class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
++                        {% comment %}
++                        Same marker contract as the Facebook and Instagram panels: a
++                        non-composer save never touches the button or language.
++                        {% endcomment %}
++                        <input type="hidden" :name="'google_business_panel_' + accId" value="1"
++                               :disabled="charLimits[accId]?.platform !== 'google_business'">
++                        <div class="flex items-center gap-2">
++                            <span class="platform-icon w-5 h-5 rounded-[5px] flex items-center justify-center"
++                                  :class="'pi-' + (charLimits[accId]?.platform || '')"
++                                  x-html="platformIconSvg(charLimits[accId]?.platform || '')"></span>
++                            <span class="text-xs font-semibold text-stone-600" x-text="charLimits[accId]?.name + ' - Google Business Settings'"></span>
++                        </div>
++                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
++                            <div>
++                                <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Button</label>
++                                <select :name="'gbp_cta_type_' + accId"
++                                        x-init="$el.value = platformExtras[accId]?.cta_type || ''"
++                                        :disabled="charLimits[accId]?.platform !== 'google_business'"
++                                        class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
++                                    <option value="">No button</option>
++                                    <option value="LEARN_MORE">Learn more</option>
++                                    <option value="BOOK">Book</option>
++                                    <option value="ORDER">Order online</option>
++                                    <option value="SHOP">Buy</option>
++                                    <option value="SIGN_UP">Sign up</option>
++                                </select>
++                            </div>
++                            <div>
++                                <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Language</label>
++                                <select :name="'gbp_language_code_' + accId"
++                                        x-init="$el.value = platformExtras[accId]?.language_code || '{{ google_business_default_language|escapejs }}'"
++                                        :disabled="charLimits[accId]?.platform !== 'google_business'"
++                                        class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
++                                    {% for code, label in google_business_languages %}
++                                    <option value="{{ code }}">{{ label }}</option>
++                                    {% endfor %}
++                                </select>
++                            </div>
++                        </div>
++                        <div>
++                            <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Button link</label>
++                            <input type="url"
++                                   :name="'gbp_link_url_' + accId"
++                                   :value="platformExtras[accId]?.link_url || ''"
++                                   :disabled="charLimits[accId]?.platform !== 'google_business'"
++                                   placeholder="https://example.com/your-page"
++                                   maxlength="2048"
++                                   class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
++                            <p class="text-[11px] text-stone-400 mt-1">Links in the post text are not clickable on Google. Pick a button and a link to send people to your page; the button is only added when both are filled in.</p>
++                        </div>
++                    </div>
++                </template>
++
+                 <!-- Pinterest settings (auto-visible when any Pinterest account is selected) -->
+                 <template x-for="accId in selectedAccounts" :key="'pin-settings-' + accId">
+                     <div x-show="charLimits[accId]?.platform === 'pinterest'"
+diff --git a/tests/providers/test_google_business_cta.py b/tests/providers/test_google_business_cta.py
+new file mode 100644
+index 0000000..d777369
+--- /dev/null
++++ b/tests/providers/test_google_business_cta.py
+@@ -0,0 +1,54 @@
++"""Google Business Profile: a link becomes the post's button, and the post
++carries the language it was written in."""
++
++from unittest.mock import MagicMock
++
++import pytest
++
++from providers.google_business import CTA_ACTION_TYPES, GoogleBusinessProvider
++from providers.types import PostType, PublishContent
++
++CREDS = {
++    "client_id": "id",
++    "client_secret": "secret",
++    "account_id": "accounts/1",
++    "location_id": "locations/10",
++}
++
++
++def _publish(**content_kwargs):
++    provider = GoogleBusinessProvider(CREDS)
++    provider._request = MagicMock(return_value=MagicMock(json=MagicMock(return_value={"name": "p"})))
++    content = PublishContent(text="Hello", post_type=PostType.TEXT, **content_kwargs)
++    provider.publish_post("token", content)
++    return provider._request.call_args.kwargs["json"]
++
++
++@pytest.mark.parametrize("action_type", CTA_ACTION_TYPES)
++def test_a_link_is_sent_as_the_chosen_button(action_type):
++    body = _publish(link_url="https://example.com/a", extra={"cta_type": action_type})
++
++    assert body["callToAction"] == {"actionType": action_type, "url": "https://example.com/a"}
++
++
++def test_a_link_without_a_chosen_button_gets_learn_more():
++    body = _publish(link_url="https://example.com/a", extra={})
++
++    assert body["callToAction"] == {"actionType": "LEARN_MORE", "url": "https://example.com/a"}
++
++
++@pytest.mark.parametrize("action_type", ["CALL", "bogus"])
++def test_an_unusable_button_type_falls_back_to_learn_more(action_type):
++    body = _publish(link_url="https://example.com/a", extra={"cta_type": action_type})
++
++    assert body["callToAction"]["actionType"] == "LEARN_MORE"
++
++
++def test_no_link_means_no_button():
++    body = _publish(extra={"cta_type": "BOOK"})
++
++    assert "callToAction" not in body
++
++
++def test_the_post_carries_its_language():
++    assert _publish(extra={"language_code": "nl"})["languageCode"] == "nl"
