@@ -1,0 +1,380 @@
+Wad Up-aanpassing op BrightBean Studio (AGPL-3.0): Instagram Story als post-type.
+
+- Composer: keuze "Publish as: Feed post / Reel / Story" voor instagram en
+  instagram_login, alleen bij precies één foto of video (zelfde contract als de
+  Facebook Reel-keuze).
+- Engine: een story-hint telt alleen bij precies één foto of video; geen eerste
+  reactie op een story.
+- Providers: geen caption meesturen bij een story.
+- Tests: apps/composer/tests/test_instagram_story.py,
+  apps/publisher/test_instagram_story.py, tests/providers/test_instagram_story.py.
+
+Gemaakt op upstream 14b92fc18549de47d42e62054215b38b4d994449.
+
+diff --git a/apps/composer/tests/test_instagram_story.py b/apps/composer/tests/test_instagram_story.py
+new file mode 100644
+index 0000000..24a7f35
+--- /dev/null
++++ b/apps/composer/tests/test_instagram_story.py
+@@ -0,0 +1,117 @@
++"""Instagram "Publish as Story" choice in the composer.
++
++Mirrors the Facebook Reel selector: the composer renders a hidden
++``instagram_panel_<id>`` marker for every selected Instagram account, and the
++``instagram_post_type_<id>`` select only when exactly one image or video is
++attached. Only a submit that carries the marker may change the stored hint.
++"""
++
++from django.urls import reverse
++
++from apps.composer.models import PlatformPost, PostMedia
++from apps.composer.tests.test_account_scope import AccountScopeTestsBase
++from apps.media_library.models import MediaAsset
++from apps.social_accounts.models import SocialAccount
++
++OK_STATUSES = (200, 204, 302)
++
++
++class InstagramStorySettingsTests(AccountScopeTestsBase):
++    platform = "instagram"
++
++    def setUp(self):
++        super().setUp()
++        self.instagram = SocialAccount.objects.create(
++            workspace=self.workspace,
++            platform=self.platform,
++            account_platform_id="ig-1",
++            account_name="Instagram Account",
++            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
++        )
++        self.instagram_pp = PlatformPost.objects.create(
++            post=self.post,
++            social_account=self.instagram,
++            status=PlatformPost.Status.DRAFT,
++        )
++        self.image = self._attach(MediaAsset.MediaType.IMAGE, "story.jpg", post=self.post)
++
++    def _instagram_payload(self, post_type=None):
++        account_id = str(self.instagram.id)
++        fields = {f"instagram_panel_{account_id}": "1"}
++        if post_type is not None:
++            fields[f"instagram_post_type_{account_id}"] = post_type
++        return self._payload(selected_accounts=account_id, account_scope=account_id, **fields)
++
++    def _save(self, data):
++        response = self.client.post(self.save_url, data=data)
++        self.assertIn(response.status_code, OK_STATUSES)
++        self.instagram_pp.refresh_from_db()
++
++    def test_story_choice_with_one_image_round_trips_into_platform_extra(self):
++        self._save(self._instagram_payload("story"))
++
++        self.assertEqual(self.instagram_pp.platform_extra["post_type"], "story")
++
++    def test_story_choice_with_one_video_round_trips_into_platform_extra(self):
++        self.post.media_attachments.all().delete()
++        self._attach(MediaAsset.MediaType.VIDEO, "story.mp4", post=self.post)
++
++        self._save(self._instagram_payload("story"))
++
++        self.assertEqual(self.instagram_pp.platform_extra["post_type"], "story")
++
++    def test_choosing_feed_clears_the_hint_and_keeps_other_extras(self):
++        self.instagram_pp.platform_extra = {"post_type": "story", "location": "x"}
++        self.instagram_pp.save(update_fields=["platform_extra"])
++
++        self._save(self._instagram_payload("feed"))
++
++        self.assertEqual(self.instagram_pp.platform_extra, {"location": "x"})
++
++    def test_story_choice_is_rejected_for_multiple_attachments(self):
++        """Two attachments are a carousel; a Story takes exactly one."""
++        image_2 = self._attach(MediaAsset.MediaType.IMAGE, "story-2.jpg")
++        PostMedia.objects.create(post=self.post, media_asset=image_2, position=1)
++
++        self._save(self._instagram_payload("story"))
++
++        self.assertNotIn("post_type", self.instagram_pp.platform_extra or {})
++
++    def test_story_choice_is_cleared_when_media_is_removed(self):
++        self.instagram_pp.platform_extra = {"post_type": "story"}
++        self.instagram_pp.save(update_fields=["platform_extra"])
++        self.post.media_attachments.all().delete()
++
++        self._save(self._instagram_payload())
++
++        self.assertEqual(self.instagram_pp.platform_extra, {})
++
++    def test_a_save_without_the_panel_leaves_the_choice_untouched(self):
++        self.instagram_pp.platform_extra = {"post_type": "story"}
++        self.instagram_pp.save(update_fields=["platform_extra"])
++        account_id = str(self.instagram.id)
++
++        self._save(self._payload(selected_accounts=account_id, account_scope=account_id))
++
++        self.assertEqual(self.instagram_pp.platform_extra, {"post_type": "story"})
++
++    def test_an_unknown_value_is_not_stored(self):
++        self._save(self._instagram_payload("reel"))
++
++        self.assertNotIn("post_type", self.instagram_pp.platform_extra or {})
++
++    def test_the_composer_renders_the_story_selector(self):
++        url = reverse("composer:compose_edit", kwargs={"workspace_id": self.workspace.id, "post_id": self.post.id})
++
++        response = self.client.get(url)
++
++        self.assertEqual(response.status_code, 200)
++        self.assertContains(response, "'instagram_post_type_' + accId")
++        self.assertContains(response, "'instagram_panel_' + accId")
++        self.assertContains(response, '<option value="story">Story</option>', html=True)
++
++
++class InstagramLoginStorySettingsTests(InstagramStorySettingsTests):
++    """Instagram (Direct) connects without Facebook but publishes Stories the same way."""
++
++    platform = "instagram_login"
+diff --git a/apps/composer/views.py b/apps/composer/views.py
+index aa8e0b4..99b6e69 100644
+--- a/apps/composer/views.py
++++ b/apps/composer/views.py
+@@ -295,6 +295,22 @@ def _sync_platform_posts(request, post, workspace, initial_status=None):
+                 extra.pop("post_type", None)
+             pp.platform_extra = extra
+ 
++        elif account.platform in ("instagram", "instagram_login") and f"instagram_panel_{acc_id}" in request.POST:
++            # Same contract as the Facebook Reel selector above: gated on the
++            # panel's hidden marker, and a Story is only recorded while exactly
++            # one image or video is attached. Anything else (feed, a stale
++            # choice after the media changed) clears the hint, so the post
++            # resolves from its media as a feed post, Reel or carousel.
++            extra = {**(pp.platform_extra or {})}
++            instagram_post_type = request.POST.get(f"instagram_post_type_{acc_id}", "").strip()
++            media_types = list(post.media_attachments.values_list("media_asset__media_type", flat=True)[:2])
++            has_exactly_one_visual = len(media_types) == 1 and media_types[0] in ("image", "video")
++            if instagram_post_type == "story" and has_exactly_one_visual:
++                extra["post_type"] = "story"
++            else:
++                extra.pop("post_type", None)
++            pp.platform_extra = extra
++
+         elif account.platform == "youtube":
+             tags_list = parse_and_truncate_youtube_tag_string(request.POST.get(f"yt_tags_{acc_id}", ""))
+             privacy_status = request.POST.get(f"yt_privacy_status_{acc_id}", "public")
+diff --git a/apps/publisher/engine.py b/apps/publisher/engine.py
+index 7c8ce7b..92aa499 100644
+--- a/apps/publisher/engine.py
++++ b/apps/publisher/engine.py
+@@ -550,6 +550,9 @@ class PublishEngine:
+             return
+         if not platform_post.social_account.supports_first_comment():
+             return
++        if (platform_post.platform_extra or {}).get("post_type") == PostType.STORY.value:
++            # Stories take no comments; queueing one would only fail later.
++            return
+         if not platform_post.effective_first_comment:
+             return
+         if platform_post.first_comment_status in (
+@@ -936,6 +939,9 @@ class PublishEngine:
+         if hint is PostType.VIDEO:
+             # _publish_video posts media_urls[0] to the video endpoint as-is.
+             return first_media_type == "video"
++        if hint is PostType.STORY:
++            # A Story container takes exactly one image or video.
++            return media_count == 1 and first_media_type in ("image", "video")
+         return True
+ 
+     @staticmethod
+diff --git a/apps/publisher/test_instagram_story.py b/apps/publisher/test_instagram_story.py
+new file mode 100644
+index 0000000..3ca414b
+--- /dev/null
++++ b/apps/publisher/test_instagram_story.py
+@@ -0,0 +1,75 @@
++"""Publishing side of the Instagram Story choice.
++
++The composer stores ``platform_extra["post_type"] = "story"``; the engine must
++only honour it while exactly one image or video is attached, and must never
++queue a first comment on a Story (Stories take no comments).
++"""
++
++from unittest.mock import patch
++
++from django.test import SimpleTestCase, TestCase
++
++from apps.composer.models import PlatformPost, Post
++from apps.organizations.models import Organization
++from apps.publisher.engine import PublishEngine
++from apps.social_accounts.models import SocialAccount
++from apps.workspaces.models import Workspace
++from providers.types import PostType
++
++
++class StoryHintMatchesMediaTest(SimpleTestCase):
++    def _resolve(self, media_count, first_media_type, platform="instagram"):
++        return PublishEngine._resolve_post_type(
++            platform=platform,
++            platform_extra={"post_type": "story"},
++            media_count=media_count,
++            first_media_type=first_media_type,
++        )
++
++    def test_one_image_or_video_publishes_as_a_story(self):
++        for media_type in ("image", "video"):
++            for platform in ("instagram", "instagram_login"):
++                with self.subTest(media_type=media_type, platform=platform):
++                    self.assertEqual(self._resolve(1, media_type, platform), PostType.STORY)
++
++    def test_a_stale_story_hint_with_two_attachments_falls_back_to_a_carousel(self):
++        self.assertEqual(self._resolve(2, "image"), PostType.CAROUSEL)
++
++    def test_a_stale_story_hint_without_media_is_ignored(self):
++        self.assertEqual(self._resolve(0, None), PostType.TEXT)
++
++
++class StoryFirstCommentTest(TestCase):
++    def setUp(self):
++        org = Organization.objects.create(name="Org")
++        workspace = Workspace.objects.create(organization=org, name="WS")
++        account = SocialAccount.objects.create(
++            workspace=workspace,
++            platform="instagram",
++            account_platform_id="ig-1",
++            account_name="IG",
++            connection_status=SocialAccount.ConnectionStatus.CONNECTED,
++        )
++        post = Post.objects.create(workspace=workspace, caption="hi", first_comment="Read more")
++        self.platform_post = PlatformPost.objects.create(
++            post=post,
++            social_account=account,
++            status=PlatformPost.Status.PUBLISHED,
++            platform_post_id="media-1",
++            platform_extra={"post_type": "story"},
++        )
++
++    def test_a_story_never_gets_a_first_comment(self):
++        with patch("apps.publisher.engine._post_first_comment_task") as task:
++            PublishEngine()._maybe_schedule_first_comment(self.platform_post)
++
++        task.assert_not_called()
++
++    def test_a_feed_post_on_the_same_account_still_does(self):
++        self.platform_post.platform_extra = {}
++        self.platform_post.save(update_fields=["platform_extra"])
++
++        with patch("apps.publisher.engine._post_first_comment_task") as task:
++            PublishEngine()._maybe_schedule_first_comment(self.platform_post)
++
++        task.assert_called_once()
+diff --git a/providers/instagram.py b/providers/instagram.py
+index 4a00fdd..bea7aca 100644
+--- a/providers/instagram.py
++++ b/providers/instagram.py
+@@ -342,7 +342,8 @@ class InstagramProvider(SocialProvider):
+         """Publish a single image, reel, or story."""
+         payload: dict = {}
+ 
+-        if content.text:
++        # A Story shows no caption, so only feed posts and Reels carry one.
++        if content.text and content.post_type != PostType.STORY:
+             payload["caption"] = content.text
+ 
+         # Route on what the asset *is*, not only on which post types name a
+diff --git a/providers/instagram_login.py b/providers/instagram_login.py
+index fa96a74..3232171 100644
+--- a/providers/instagram_login.py
++++ b/providers/instagram_login.py
+@@ -321,7 +321,8 @@ class InstagramLoginProvider(SocialProvider):
+ 
+     def _publish_single(self, access_token: str, content: PublishContent) -> PublishResult:
+         payload: dict = {}
+-        if content.text:
++        # A Story shows no caption, so only feed posts and Reels carry one.
++        if content.text and content.post_type != PostType.STORY:
+             payload["caption"] = content.text
+ 
+         # Route on what the asset *is*, not only on which post types name a
+diff --git a/templates/composer/compose.html b/templates/composer/compose.html
+index e9bba9a..f8fa2b0 100644
+--- a/templates/composer/compose.html
++++ b/templates/composer/compose.html
+@@ -595,6 +595,38 @@
+                     </div>
+                 </template>
+ 
++                <!-- Instagram destination: feed post / Reel by default, or a Story (one image or video) -->
++                <template x-for="accId in selectedAccounts" :key="'instagram-story-settings-' + accId">
++                    <div x-show="['instagram', 'instagram_login'].includes(charLimits[accId]?.platform) && hasSingleMediaAttached"
++                         x-data="{ instagramPostType: platformExtras[accId]?.post_type === 'story' ? 'story' : 'feed' }"
++                         class="border border-stone-200 rounded-xl bg-white p-4 space-y-3">
++                        {% comment %}
++                        Same marker contract as the Facebook panel: present for every
++                        selected Instagram account so a save can clear a stale Story
++                        choice, while a non-composer save never touches it.
++                        {% endcomment %}
++                        <input type="hidden" :name="'instagram_panel_' + accId" value="1"
++                               :disabled="!['instagram', 'instagram_login'].includes(charLimits[accId]?.platform)">
++                        <div class="flex items-center gap-2">
++                            <span class="platform-icon w-5 h-5 rounded-[5px] flex items-center justify-center"
++                                  :class="'pi-' + (charLimits[accId]?.platform || '')"
++                                  x-html="platformIconSvg(charLimits[accId]?.platform || '')"></span>
++                            <span class="text-xs font-semibold text-stone-600" x-text="charLimits[accId]?.name + ' - Instagram Settings'"></span>
++                        </div>
++                        <div>
++                            <label class="block text-[11px] font-semibold text-stone-400 uppercase tracking-wider mb-1">Publish as</label>
++                            <select :name="'instagram_post_type_' + accId"
++                                    x-model="instagramPostType"
++                                    :disabled="!['instagram', 'instagram_login'].includes(charLimits[accId]?.platform) || !hasSingleMediaAttached"
++                                    class="w-full text-sm px-3 py-2 rounded-lg border border-stone-200 bg-white outline-none focus:border-orange-500 focus:ring-2 focus:ring-orange-100 transition-all">
++                                <option value="feed">Feed post / Reel</option>
++                                <option value="story">Story</option>
++                            </select>
++                            <p class="text-[11px] text-stone-400 mt-1">A Story shows for 24 hours and takes one image or video (9:16 works best). The caption and first comment are not posted with a Story; stickers, links and music have to be added in the Instagram app.</p>
++                        </div>
++                    </div>
++                </template>
++
+                 <!-- Pinterest settings (auto-visible when any Pinterest account is selected) -->
+                 <template x-for="accId in selectedAccounts" :key="'pin-settings-' + accId">
+                     <div x-show="charLimits[accId]?.platform === 'pinterest'"
+@@ -2080,6 +2112,7 @@ function composerApp() {
+         hasMediaAttached: false,
+         hasVideoAttached: false,
+         hasSingleVideoAttached: false,
++        hasSingleMediaAttached: false,
+         showFramePicker: false,
+         framePickerAccId: null,
+         framePickerMode: 'upload',
+@@ -2250,6 +2283,7 @@ function composerApp() {
+                 this.hasMediaAttached = thumbs.length > 0;
+                 this.hasVideoAttached = videoCount > 0;
+                 this.hasSingleVideoAttached = thumbs.length === 1 && videoCount === 1;
++                this.hasSingleMediaAttached = thumbs.length === 1;
+             };
+             this.$nextTick(syncVideoAttached);
+             document.body.addEventListener('previewUpdate', syncVideoAttached);
+diff --git a/tests/providers/test_instagram_story.py b/tests/providers/test_instagram_story.py
+new file mode 100644
+index 0000000..ad4b9ce
+--- /dev/null
++++ b/tests/providers/test_instagram_story.py
+@@ -0,0 +1,19 @@
++"""Instagram Stories carry no caption: it is never shown, so it is not sent."""
++
++import pytest
++
++from providers.types import PostType
++from tests.providers.test_instagram import IG_PUBLISHERS, IMAGE_URL, VIDEO_URL, _publish
++
++
++@pytest.mark.parametrize(("make_provider", "create_url"), IG_PUBLISHERS)
++@pytest.mark.parametrize(("url", "field"), [(IMAGE_URL, "image_url"), (VIDEO_URL, "video_url")])
++def test_a_story_is_sent_without_its_caption(make_provider, create_url, url, field):
++    provider = make_provider()
++
++    _publish(provider, text="Only for the feed", media_urls=[url], post_type=PostType.STORY)
++
++    assert provider._request.call_args_list[0].kwargs["json"] == {
++        "media_type": "STORIES",
++        field: url,
++    }
