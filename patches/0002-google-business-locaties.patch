@@ -1,0 +1,642 @@
+# Eigen patch voor BrightBean Studio (AGPL-3.0), bovenop 0001.
+# Google Bedrijfsprofiel: readMask bij het ophalen van vestigingen, vestiging kiezen
+# via het keuzescherm, posts naar precies de gekozen vestiging, en loskoppelen van
+# één vestiging trekt de gedeelde Google-toegang niet in.
+diff --git a/apps/publisher/engine.py b/apps/publisher/engine.py
+index 92aa499..2ba1577 100644
+--- a/apps/publisher/engine.py
++++ b/apps/publisher/engine.py
+@@ -116,6 +116,15 @@ def _resolve_publish_credentials(account):
+         # comment's ``username`` without a ``from`` object, and an unrecognised
+         # own comment lands in the inbox as an inbound message from ourselves.
+         credentials["account_handle"] = account.account_handle
++    elif platform == "google_business":
++        # The connection is one location, stored as accounts/{a}/locations/{l}.
++        # Without these the provider falls back to the first location the
++        # grant can see, which is a different business for anyone who manages
++        # more than one profile.
++        account_id, sep, location = account.account_platform_id.partition("/locations/")
++        if sep and account_id.startswith("accounts/") and location:
++            credentials["account_id"] = account_id
++            credentials["location_id"] = f"locations/{location}"
+ 
+     return credentials
+ 
+diff --git a/apps/publisher/test_google_business_credentials.py b/apps/publisher/test_google_business_credentials.py
+new file mode 100644
+index 0000000..80fbae7
+--- /dev/null
++++ b/apps/publisher/test_google_business_credentials.py
+@@ -0,0 +1,39 @@
++"""Publishing, the health check and the inbox all reach a Google Business
++connection through its own location, never the first one the grant can see."""
++
++import pytest
++
++from apps.publisher.engine import _resolve_publish_credentials
++from apps.social_accounts.models import SocialAccount
++
++
++@pytest.fixture
++def workspace(db, organization):
++    from apps.workspaces.models import Workspace
++
++    return Workspace.objects.create(name="WS", organization=organization)
++
++
++def _account(workspace, platform_id):
++    return SocialAccount.objects.create(
++        workspace=workspace,
++        platform="google_business",
++        account_platform_id=platform_id,
++        account_name="Location",
++        oauth_access_token="token",
++    )
++
++
++def test_the_connected_location_is_passed_to_the_provider(workspace):
++    credentials = _resolve_publish_credentials(_account(workspace, "accounts/2/locations/20"))
++
++    assert credentials["account_id"] == "accounts/2"
++    assert credentials["location_id"] == "locations/20"
++
++
++@pytest.mark.parametrize("platform_id", ["locations/20", "accounts/2", ""])
++def test_an_id_without_account_and_location_sets_neither(workspace, platform_id):
++    credentials = _resolve_publish_credentials(_account(workspace, platform_id))
++
++    assert "account_id" not in credentials
++    assert "location_id" not in credentials
+diff --git a/apps/social_accounts/tests/test_google_business_connect.py b/apps/social_accounts/tests/test_google_business_connect.py
+new file mode 100644
+index 0000000..a9a1a03
+--- /dev/null
++++ b/apps/social_accounts/tests/test_google_business_connect.py
+@@ -0,0 +1,146 @@
++"""Connecting Google Business Profile: the user picks locations, each one is
++driven by the user's grant, and disconnecting one leaves the others working."""
++
++from unittest.mock import MagicMock, patch
++
++import pytest
++from django.contrib.messages import get_messages
++from django.urls import reverse
++
++from apps.social_accounts.models import SocialAccount
++from apps.social_accounts.views import OAUTH_SESSION_KEY, _sign_state
++from providers.types import OAuthTokens
++
++
++@pytest.fixture
++def workspace(db, organization):
++    from apps.workspaces.models import Workspace
++
++    return Workspace.objects.create(name="Test WS", organization=organization)
++
++
++@pytest.fixture
++def authenticated_client(client, user, organization, workspace):
++    from apps.members.models import OrgMembership, WorkspaceMembership
++
++    OrgMembership.objects.create(user=user, organization=organization, org_role="owner")
++    WorkspaceMembership.objects.create(user=user, workspace=workspace, workspace_role="manager")
++    client.force_login(user)
++    return client
++
++
++def _callback(client, workspace, user, provider):
++    nonce = "nonce-gbp"
++    state = _sign_state(workspace.id, "google_business", user.id, nonce)
++    session = client.session
++    session[OAUTH_SESSION_KEY] = {"nonce": nonce}
++    session.save()
++    url = reverse("social_accounts:oauth_callback", kwargs={"platform": "google_business"})
++    with patch("apps.social_accounts.views._get_provider_for_platform", return_value=provider):
++        return client.get(url, {"code": "abc", "state": state})
++
++
++def test_callback_sends_the_user_to_the_location_picker(authenticated_client, workspace, user):
++    provider = MagicMock()
++    provider.exchange_code.return_value = OAuthTokens(
++        access_token="user-token", refresh_token="refresh", expires_in=3599
++    )
++    provider.get_user_pages.return_value = [
++        {"id": "accounts/1/locations/10", "name": "Wad Up", "category": "Franeker", "picture": None},
++        {"id": "accounts/2/locations/20", "name": "Client", "category": "Agency", "picture": None},
++    ]
++
++    response = _callback(authenticated_client, workspace, user, provider)
++
++    assert response.status_code == 302
++    assert response.url == reverse("social_accounts:select_account")
++    provider.get_profile.assert_not_called()
++    provider.refresh_token.assert_not_called()
++    page_data = authenticated_client.session["oauth_page_select"]
++    assert page_data["platform"] == "google_business"
++    assert [p["id"] for p in page_data["pages"]] == ["accounts/1/locations/10", "accounts/2/locations/20"]
++    assert page_data["user_tokens"]["expires_in"] == 3599
++
++    picker = authenticated_client.get(reverse("social_accounts:select_account"))
++    assert b"Google Business Profile login" in picker.content
++    assert b"Client" in picker.content
++
++
++def test_callback_without_locations_explains_why(authenticated_client, workspace, user):
++    provider = MagicMock()
++    provider.exchange_code.return_value = OAuthTokens(access_token="user-token", refresh_token="refresh")
++    provider.get_user_pages.return_value = []
++
++    response = _callback(authenticated_client, workspace, user, provider)
++
++    assert response.status_code == 302
++    assert not SocialAccount.objects.filter(platform="google_business").exists()
++    texts = [str(m) for m in get_messages(response.wsgi_request)]
++    assert any("No Google Business Profile locations" in t for t in texts)
++
++
++def test_only_the_picked_location_is_connected_on_the_users_grant(authenticated_client, workspace):
++    session = authenticated_client.session
++    session["oauth_page_select"] = {
++        "workspace_id": str(workspace.id),
++        "platform": "google_business",
++        "user_tokens": {"access_token": "user-token", "refresh_token": "refresh", "expires_in": 3599},
++        "pages": [
++            {"id": "accounts/1/locations/10", "name": "Wad Up", "category": "Franeker", "picture": None},
++            {"id": "accounts/2/locations/20", "name": "Client", "category": "Agency", "picture": None},
++        ],
++    }
++    session.save()
++
++    response = authenticated_client.post(
++        reverse("social_accounts:select_account"), {"selected_pages": ["accounts/1/locations/10"]}
++    )
++
++    assert response.status_code == 302
++    account = SocialAccount.objects.get(workspace=workspace, platform="google_business")
++    assert account.account_platform_id == "accounts/1/locations/10"
++    assert account.account_name == "Wad Up"
++    assert account.oauth_access_token == "user-token"
++    assert account.oauth_refresh_token == "refresh"
++    assert account.token_expires_at is not None
++
++
++def _gbp(workspace, platform_id, refresh):
++    return SocialAccount.objects.create(
++        workspace=workspace,
++        platform="google_business",
++        account_platform_id=platform_id,
++        account_name=platform_id,
++        oauth_access_token="access",
++        oauth_refresh_token=refresh,
++    )
++
++
++def _disconnect(client, workspace, account):
++    url = reverse("social_accounts:disconnect", kwargs={"workspace_id": workspace.id, "account_id": account.id})
++    with (
++        patch("apps.social_accounts.views.unsubscribe_account_webhooks"),
++        patch("providers.get_provider") as get_provider,
++    ):
++        response = client.post(url)
++    assert response.status_code == 302
++    return get_provider.return_value.revoke_token
++
++
++def test_disconnecting_one_location_keeps_the_shared_grant(authenticated_client, workspace):
++    first = _gbp(workspace, "accounts/1/locations/10", "shared-refresh")
++    second = _gbp(workspace, "accounts/1/locations/11", "shared-refresh")
++
++    revoke = _disconnect(authenticated_client, workspace, first)
++
++    revoke.assert_not_called()
++    assert SocialAccount.objects.filter(pk=second.pk).exists()
++
++
++def test_the_last_location_on_a_grant_revokes_it(authenticated_client, workspace):
++    _gbp(workspace, "accounts/9/locations/90", "other-refresh")
++    last = _gbp(workspace, "accounts/1/locations/10", "shared-refresh")
++
++    revoke = _disconnect(authenticated_client, workspace, last)
++
++    revoke.assert_called_once_with("shared-refresh")
+diff --git a/apps/social_accounts/views.py b/apps/social_accounts/views.py
+index 9cf8408..c980eb9 100644
+--- a/apps/social_accounts/views.py
++++ b/apps/social_accounts/views.py
+@@ -341,11 +341,14 @@ def oauth_callback(request, platform):
+         redirect_uri = redirect_uri_from_request(request)
+         tokens = provider.exchange_code(code, redirect_uri, **pkce_kwargs(session_data.get("code_verifier")))
+ 
+-        # Facebook/Instagram/LinkedIn Company: connect Pages, not personal profiles
++        # Facebook/Instagram/LinkedIn Company: connect Pages, not personal profiles.
++        # Google Business Profile: one login often manages many locations, so
++        # the user picks them the same way.
+         if platform in (
+             PlatformCredential.Platform.FACEBOOK,
+             PlatformCredential.Platform.INSTAGRAM,
+             PlatformCredential.Platform.LINKEDIN_COMPANY,
++            PlatformCredential.Platform.GOOGLE_BUSINESS,
+         ) and hasattr(provider, "get_user_pages"):
+             tokens, promoted = promote_meta_user_token(provider, platform, tokens)
+             pages = provider.get_user_pages(tokens.access_token)
+@@ -393,6 +396,13 @@ def oauth_callback(request, platform):
+                         "you Admin access in LinkedIn \u2192 Admin tools \u2192 "
+                         "Manage admins, then reconnect."
+                     )
++                elif platform == PlatformCredential.Platform.GOOGLE_BUSINESS:
++                    warning = (
++                        "No Google Business Profile locations were found for this Google account. "
++                        "Only profiles where the account is an owner or manager can be connected. "
++                        "If you expected to see one, sign in with the Google account that manages "
++                        "the profile, then reconnect."
++                    )
+                 else:
+                     if platform == PlatformCredential.Platform.INSTAGRAM:
+                         warning = (
+@@ -876,7 +886,7 @@ def disconnect(request, workspace_id, account_id):
+         from providers import get_provider
+ 
+         provider = get_provider(account.platform, _resolve_publish_credentials(account))
+-        if account.revocation_token:
++        if account.revocation_token and not _grant_is_shared(account):
+             provider.revoke_token(account.revocation_token)
+     except Exception:
+         logger.warning(
+@@ -917,6 +927,21 @@ def disconnect(request, workspace_id, account_id):
+ # ------------------------------------------------------------------
+ 
+ 
++def _grant_is_shared(account) -> bool:
++    """Whether another connection runs on the same Google grant as ``account``.
++
++    Locations picked from one Google Business login all carry that login's
++    refresh token, and revoking it revokes the grant for every one of them.
++    Disconnecting one location must leave the others working, so the grant is
++    only revoked together with the last connection that uses it.
++    """
++    if account.platform != PlatformCredential.Platform.GOOGLE_BUSINESS or not account.oauth_refresh_token:
++        return False
++    # The token column is encrypted, so compare in Python, not in SQL.
++    others = SocialAccount.objects.filter(platform=account.platform).exclude(pk=account.pk)
++    return any(other.oauth_refresh_token == account.oauth_refresh_token for other in others)
++
++
+ def promote_meta_user_token(provider, platform, tokens) -> tuple[object, bool]:
+     """Trade a Meta authorization-code token for a long-lived one, if we can.
+ 
+@@ -992,6 +1017,10 @@ def resolve_page_account_token(page: dict, platform: str, user_access_token: str
+     token = page.get("access_token")
+     if not token and platform == PlatformCredential.Platform.INSTAGRAM:
+         token = user_access_token
++    if platform == PlatformCredential.Platform.GOOGLE_BUSINESS:
++        # Google has no per-location token: every location is driven by the
++        # user's own grant.
++        token = user_access_token
+     return token or ""
+ 
+ 
+diff --git a/providers/google_business.py b/providers/google_business.py
+index 66934bb..6fa225e 100644
+--- a/providers/google_business.py
++++ b/providers/google_business.py
+@@ -27,6 +27,10 @@ ACCOUNTS_API = "https://mybusinessaccountmanagement.googleapis.com/v1"
+ BUSINESS_INFO_API = "https://mybusinessbusinessinformation.googleapis.com/v1"
+ POSTS_API = "https://mybusiness.googleapis.com/v4"
+ 
++# Fields read from a location: the Business Information API requires a readMask.
++LOCATION_READ_MASK = "name,title,storefrontAddress,phoneNumbers"
++PAGE_SIZE = 100
++
+ 
+ class GoogleBusinessProvider(SocialProvider):
+     """Google Business Profile provider.
+@@ -165,18 +169,50 @@ class GoogleBusinessProvider(SocialProvider):
+     # Account / location helpers
+     # ------------------------------------------------------------------
+ 
++    def _list_accounts(self, access_token: str) -> list[dict]:
++        """Every Business Profile account the grant can see, across all pages."""
++        accounts: list[dict] = []
++        params: dict = {"pageSize": PAGE_SIZE}
++        while True:
++            data = self._request(
++                "GET",
++                f"{ACCOUNTS_API}/accounts",
++                access_token=access_token,
++                params=params,
++            ).json()
++            accounts.extend(data.get("accounts", []))
++            token = data.get("nextPageToken")
++            if not token:
++                return accounts
++            params = {"pageSize": PAGE_SIZE, "pageToken": token}
++
++    def _list_locations(self, access_token: str, account_id: str) -> list[dict]:
++        """Every location of ``account_id``, across all pages.
++
++        ``readMask`` is required by the Business Information API: without it
++        Google rejects the call with 400 INVALID_ARGUMENT.
++        """
++        locations: list[dict] = []
++        params: dict = {"readMask": LOCATION_READ_MASK, "pageSize": PAGE_SIZE}
++        while True:
++            data = self._request(
++                "GET",
++                f"{BUSINESS_INFO_API}/{account_id}/locations",
++                access_token=access_token,
++                params=params,
++            ).json()
++            locations.extend(data.get("locations", []))
++            token = data.get("nextPageToken")
++            if not token:
++                return locations
++            params = {"readMask": LOCATION_READ_MASK, "pageSize": PAGE_SIZE, "pageToken": token}
++
+     def _get_account_id(self, access_token: str) -> str:
+         """Return the account ID from credentials or by listing accounts."""
+         if self.credentials.get("account_id"):
+             return self.credentials["account_id"]
+ 
+-        resp = self._request(
+-            "GET",
+-            f"{ACCOUNTS_API}/accounts",
+-            access_token=access_token,
+-        )
+-        data = resp.json()
+-        accounts = data.get("accounts", [])
++        accounts = self._list_accounts(access_token)
+         if not accounts:
+             raise PublishError(
+                 "No Google Business accounts found",
+@@ -190,13 +226,7 @@ class GoogleBusinessProvider(SocialProvider):
+         if self.credentials.get("location_id"):
+             return self.credentials["location_id"]
+ 
+-        resp = self._request(
+-            "GET",
+-            f"{BUSINESS_INFO_API}/{account_id}/locations",
+-            access_token=access_token,
+-        )
+-        data = resp.json()
+-        locations = data.get("locations", [])
++        locations = self._list_locations(access_token, account_id)
+         if not locations:
+             raise PublishError(
+                 "No locations found for Google Business account",
+@@ -204,35 +234,72 @@ class GoogleBusinessProvider(SocialProvider):
+             )
+         return locations[0]["name"]
+ 
++    @staticmethod
++    def _profile_from_location(account_id: str, loc: dict) -> AccountProfile:
++        """Build the profile of one location.
++
++        The platform id is the full ``accounts/{a}/locations/{l}`` path: the
++        Business Information API names a location ``locations/{l}``, but the
++        v4 localPosts endpoint needs the owning account in the path too, and
++        the account is what ties a connection to one specific location.
++        """
++        address_lines = (loc.get("storefrontAddress") or {}).get("addressLines") or []
++        return AccountProfile(
++            platform_id=f"{account_id}/{loc['name']}",
++            name=loc.get("title") or loc["name"],
++            handle=None,
++            extra={
++                "address": ", ".join(address_lines),
++                "phone": (loc.get("phoneNumbers") or {}).get("primaryPhone", ""),
++            },
++        )
++
++    def get_user_pages(self, access_token: str) -> list[dict]:
++        """Every location the grant can post to, for the account picker.
++
++        One Google login often manages many profiles (an agency, a chain), so
++        the user picks which locations to connect instead of the first one
++        being taken. A location can be listed under more than one account (a
++        location group and its owner); it is offered once.
++        """
++        pages: list[dict] = []
++        seen: set[str] = set()
++        for account in self._list_accounts(access_token):
++            for loc in self._list_locations(access_token, account["name"]):
++                if loc["name"] in seen:
++                    continue
++                seen.add(loc["name"])
++                profile = self._profile_from_location(account["name"], loc)
++                pages.append(
++                    {
++                        "id": profile.platform_id,
++                        "name": profile.name,
++                        "category": profile.extra["address"] or account.get("accountName", ""),
++                        "picture": None,
++                    }
++                )
++        return pages
++
+     # ------------------------------------------------------------------
+     # Profile
+     # ------------------------------------------------------------------
+ 
+     def get_profile(self, access_token: str) -> AccountProfile:
+-        """Fetch the Google Business account and primary location info."""
++        """Fetch the connected location, or the first one when none is set yet."""
+         account_id = self._get_account_id(access_token)
+ 
+-        resp = self._request(
+-            "GET",
+-            f"{BUSINESS_INFO_API}/{account_id}/locations",
+-            access_token=access_token,
+-        )
+-        data = resp.json()
+-        locations = data.get("locations", [])
+-
++        if self.credentials.get("location_id"):
++            loc = self._request(
++                "GET",
++                f"{BUSINESS_INFO_API}/{self.credentials['location_id']}",
++                access_token=access_token,
++                params={"readMask": LOCATION_READ_MASK},
++            ).json()
++            return self._profile_from_location(account_id, loc)
++
++        locations = self._list_locations(access_token, account_id)
+         if locations:
+-            loc = locations[0]
+-            name = loc.get("title", loc.get("name", ""))
+-            address_obj = loc.get("storefrontAddress", {})
+-            address_lines = address_obj.get("addressLines", [])
+-            address = ", ".join(address_lines) if address_lines else ""
+-            phone = loc.get("phoneNumbers", {}).get("primaryPhone", "")
+-            return AccountProfile(
+-                platform_id=loc.get("name", account_id),
+-                name=name,
+-                handle=None,
+-                extra={"address": address, "phone": phone},
+-            )
++            return self._profile_from_location(account_id, locations[0])
+ 
+         return AccountProfile(
+             platform_id=account_id,
+@@ -278,7 +345,8 @@ class GoogleBusinessProvider(SocialProvider):
+ 
+         resp = self._request(
+             "POST",
+-            f"{POSTS_API}/{location_id}/localPosts",
++            # v4 addresses a location through its account: accounts/{a}/locations/{l}.
++            f"{POSTS_API}/{account_id}/{location_id}/localPosts",
+             access_token=access_token,
+             json=body,
+         )
+diff --git a/templates/social_accounts/account_select.html b/templates/social_accounts/account_select.html
+index 7188e09..9ea7db5 100644
+--- a/templates/social_accounts/account_select.html
++++ b/templates/social_accounts/account_select.html
+@@ -12,7 +12,7 @@
+         </div>
+         {% endif %}
+         <h2 class="text-xl font-semibold text-stone-900">Select Account{{ pages|length|pluralize }}</h2>
+-        <p class="text-sm text-stone-500 mt-1">Your {% if platform == "youtube" %}YouTube{% else %}{{ platform|title }}{% endif %} login has access to multiple accounts. Select which one{{ pages|length|pluralize }} to connect.</p>
++        <p class="text-sm text-stone-500 mt-1">Your {% if platform == "youtube" %}YouTube{% elif platform == "google_business" %}Google Business Profile{% else %}{{ platform|title }}{% endif %} login has access to multiple accounts. Select which one{{ pages|length|pluralize }} to connect.</p>
+     </div>
+ 
+     <form method="post" action="{% url 'social_accounts:select_account' %}">
+diff --git a/tests/providers/test_google_business_locations.py b/tests/providers/test_google_business_locations.py
+new file mode 100644
+index 0000000..d2cfdd1
+--- /dev/null
++++ b/tests/providers/test_google_business_locations.py
+@@ -0,0 +1,134 @@
++"""Google Business Profile: locations are listed with a readMask, picked one by
++one, and every post goes to the location the connection was made for."""
++
++from unittest.mock import MagicMock
++
++from providers.google_business import (
++    ACCOUNTS_API,
++    BUSINESS_INFO_API,
++    LOCATION_READ_MASK,
++    POSTS_API,
++    GoogleBusinessProvider,
++)
++from providers.types import PublishContent
++
++CREDS = {"client_id": "id", "client_secret": "secret"}
++
++
++def _resp(data):
++    return MagicMock(json=MagicMock(return_value=data))
++
++
++def _location(loc_id, title, address=None):
++    loc = {"name": f"locations/{loc_id}", "title": title}
++    if address:
++        loc["storefrontAddress"] = {"addressLines": address}
++    return loc
++
++
++def _router(routes):
++    """A _request stub answering by (url, pageToken)."""
++
++    def _request(method, url, **kwargs):
++        token = (kwargs.get("params") or {}).get("pageToken")
++        return _resp(routes[(url, token)])
++
++    return MagicMock(side_effect=_request)
++
++
++def test_locations_are_listed_with_a_read_mask_and_every_page_is_read():
++    provider = GoogleBusinessProvider(CREDS)
++    url = f"{BUSINESS_INFO_API}/accounts/1/locations"
++    provider._request = _router(
++        {
++            (url, None): {"locations": [_location(10, "First")], "nextPageToken": "p2"},
++            (url, "p2"): {"locations": [_location(11, "Second")]},
++        }
++    )
++
++    locations = provider._list_locations("token", "accounts/1")
++
++    assert [loc["title"] for loc in locations] == ["First", "Second"]
++    for call in provider._request.call_args_list:
++        assert call.kwargs["params"]["readMask"] == LOCATION_READ_MASK
++
++
++def test_the_picker_lists_every_location_of_every_account_once():
++    provider = GoogleBusinessProvider(CREDS)
++    provider._request = _router(
++        {
++            (f"{ACCOUNTS_API}/accounts", None): {
++                "accounts": [
++                    {"name": "accounts/1", "accountName": "Personal"},
++                    {"name": "accounts/2", "accountName": "Agency group"},
++                ]
++            },
++            (f"{BUSINESS_INFO_API}/accounts/1/locations", None): {
++                "locations": [_location(10, "Wad Up", ["Voorstraat 1", "Franeker"])]
++            },
++            (f"{BUSINESS_INFO_API}/accounts/2/locations", None): {
++                # A location can show up under its group as well as its owner.
++                "locations": [_location(10, "Wad Up"), _location(20, "Client")]
++            },
++        }
++    )
++
++    pages = provider.get_user_pages("token")
++
++    assert pages == [
++        {
++            "id": "accounts/1/locations/10",
++            "name": "Wad Up",
++            "category": "Voorstraat 1, Franeker",
++            "picture": None,
++        },
++        {
++            "id": "accounts/2/locations/20",
++            "name": "Client",
++            "category": "Agency group",
++            "picture": None,
++        },
++    ]
++
++
++def test_profile_of_a_connected_location_is_that_location():
++    provider = GoogleBusinessProvider({**CREDS, "account_id": "accounts/2", "location_id": "locations/20"})
++    provider._request = MagicMock(return_value=_resp(_location(20, "Client", ["Kerkstraat 5"])))
++
++    profile = provider.get_profile("token")
++
++    assert profile.platform_id == "accounts/2/locations/20"
++    assert profile.name == "Client"
++    assert profile.extra["address"] == "Kerkstraat 5"
++    provider._request.assert_called_once()
++    call = provider._request.call_args
++    assert call.args == ("GET", f"{BUSINESS_INFO_API}/locations/20")
++    assert call.kwargs["params"] == {"readMask": LOCATION_READ_MASK}
++
++
++def test_profile_without_a_connection_falls_back_to_the_first_location():
++    provider = GoogleBusinessProvider(CREDS)
++    provider._request = _router(
++        {
++            (f"{ACCOUNTS_API}/accounts", None): {"accounts": [{"name": "accounts/1"}]},
++            (f"{BUSINESS_INFO_API}/accounts/1/locations", None): {"locations": [_location(10, "Wad Up")]},
++        }
++    )
++
++    profile = provider.get_profile("token")
++
++    assert profile.platform_id == "accounts/1/locations/10"
++    assert profile.name == "Wad Up"
++
++
++def test_a_post_goes_to_the_connected_location_under_its_account():
++    provider = GoogleBusinessProvider({**CREDS, "account_id": "accounts/2", "location_id": "locations/20"})
++    provider._request = MagicMock(return_value=_resp({"name": "accounts/2/locations/20/localPosts/99"}))
++
++    result = provider.publish_post("token", PublishContent(text="Open op zaterdag"))
++
++    provider._request.assert_called_once()
++    call = provider._request.call_args
++    assert call.args == ("POST", f"{POSTS_API}/accounts/2/locations/20/localPosts")
++    assert call.kwargs["json"]["summary"] == "Open op zaterdag"
++    assert result.platform_post_id == "accounts/2/locations/20/localPosts/99"
