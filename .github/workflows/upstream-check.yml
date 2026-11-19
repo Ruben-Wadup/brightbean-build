@@ -1,0 +1,111 @@
+name: Upstream-check
+
+# Kijkt elke week of onze patches nog passen op de nieuwste BrightBean Studio
+# (main van brightbeanxyz/brightbean-studio) en draait daar de volledige testsuite op.
+# Bouwt en deployt niets. Faalt deze run, dan mailt GitHub; zie de README voor wat je
+# dan doet. Hij faalt ook als een patch al in upstream zit (bijvoorbeeld na het mergen
+# van onze PR): haal die patch dan uit patches/.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # maandag 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-check
+  cancel-in-progress: true
+
+env:
+  UPSTREAM: brightbeanxyz/brightbean-studio
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DJANGO_SETTINGS_MODULE: config.settings.test
+      SECRET_KEY: test-secret-key-not-for-production
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/brightbean_test
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    steps:
+      - name: Checkout deze repo
+        uses: actions/checkout@v4
+
+      - name: Checkout BrightBean Studio (main)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: main
+          path: src
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Vergelijk met BRIGHTBEAN_REF
+        run: |
+          ref=$(tr -d '[:space:]' < BRIGHTBEAN_REF)
+          head=$(git -C src rev-parse HEAD)
+          ahead=$(git -C src rev-list --count "$ref..$head")
+          {
+            echo "### Upstream"
+            echo "- Wij draaien: \`${ref:0:12}\`"
+            echo "- Upstream main: \`${head:0:12}\` ($ahead commit(s) verder)"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ahead" -gt 0 ]; then
+            echo "Nieuwe upstream-commits sinds BRIGHTBEAN_REF:"
+            git -C src log --oneline "$ref..$head" | head -50
+          fi
+
+      - name: Patches toepassen op upstream main
+        run: |
+          shopt -s nullglob
+          echo "### Patches" >> "$GITHUB_STEP_SUMMARY"
+          fail=0
+          for p in patches/*.patch; do
+            f="$GITHUB_WORKSPACE/$p"
+            if git -C src apply --check --whitespace=nowarn "$f" 2>/dev/null; then
+              git -C src apply --whitespace=nowarn "$f"
+              echo "- \`$p\`: past" >> "$GITHUB_STEP_SUMMARY"
+            elif git -C src apply --check --reverse --whitespace=nowarn "$f" 2>/dev/null; then
+              echo "::error::$p zit al in upstream. Haal hem uit patches/ en verhoog BRIGHTBEAN_REF."
+              echo "- \`$p\`: zit al in upstream, mag weg" >> "$GITHUB_STEP_SUMMARY"
+              fail=1
+            else
+              echo "::error::$p past niet meer op upstream main. Werk de patch bij (of kijk of upstream hem in aangepaste vorm heeft overgenomen)."
+              echo "- \`$p\`: past niet meer" >> "$GITHUB_STEP_SUMMARY"
+              git -C src apply --check --whitespace=nowarn "$f" || true
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: src/requirements.txt
+
+      - name: Dependencies installeren
+        working-directory: src
+        run: pip install -r requirements.txt
+
+      # Zelfde aanpak als de CI van upstream: de PostgreSQL 16 die al op de runner staat.
+      - name: PostgreSQL starten
+        run: |
+          sudo systemctl start postgresql.service
+          pg_isready --timeout=30
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          sudo -u postgres createdb brightbean_test
+
+      - name: Testsuite (upstream main + patches)
+        working-directory: src
+        run: pytest -q -p no:cacheprovider
+
+      - name: Samenvatting
+        if: success()
+        run: |
+          echo "Alles groen: de patches passen op upstream main en de tests slagen." >> "$GITHUB_STEP_SUMMARY"
